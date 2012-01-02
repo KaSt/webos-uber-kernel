@@ -13,6 +13,8 @@
  *                      Jun Nakajima <jun.nakajima@intel.com>
  *            (C)  2009 Palm Inc, Corey Tabaka <corey.tabaka@palm.com>
  *
+ *		Screenstate mod by uNiXpXyChO
+ *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
  * published by the Free Software Foundation.
@@ -294,6 +296,30 @@ static int get_num_sample_records(void) {
 	}
 
 	return count;
+}
+
+static bool ss_enabled = 0;
+static unsigned int sleep_max_freq = 432000;
+extern bool msm_fb_state;
+
+static int cpufreq_target(struct cpufreq_policy *policy, unsigned int freq,
+							unsigned int relation)
+{
+	int retval = -EINVAL;
+
+	if(msm_fb_state || !ss_enabled) {
+		retval = __cpufreq_driver_target(policy, freq, relation);
+	}
+	else {
+		if(freq <= sleep_max_freq)
+			retval = __cpufreq_driver_target(policy, freq,
+								relation);
+		else
+			retval = __cpufreq_driver_target(policy, sleep_max_freq,
+								relation);
+	}
+
+	return retval;
 }
 
 static void *stats_start(struct seq_file *m, loff_t *pos)
@@ -748,6 +774,18 @@ static ssize_t show_sampling_rate_min(struct kobject *kobj,
 	return sprintf(buf, "%u\n", min_sampling_rate);
 }
 
+static ssize_t show_screen_off_max_freq(struct kobject *kobj,
+					struct attribute *attr, char *buf)
+{
+	return sprintf(buf, "%u\n", sleep_max_freq);
+}
+ 
+static ssize_t show_screenstate_enable(struct kobject *kobj,
+					struct attribute *attr, char *buf)
+{
+	return sprintf(buf, "%u\n", ss_enabled);
+}
+
 define_one_global_ro(sampling_rate_max);
 define_one_global_ro(sampling_rate_min);
 
@@ -758,6 +796,7 @@ static ssize_t show_##file_name						\
 {									\
 	return sprintf(buf, "%u\n", dbs_tuners_ins.object);		\
 }
+
 show_one(sampling_rate, sampling_rate);
 show_one(io_is_busy, io_is_busy);
 show_one(up_threshold, up_threshold);
@@ -990,6 +1029,45 @@ static ssize_t store_max_floor_window(struct kobject *a, struct attribute *b,
 	return count;
 }
 
+static ssize_t store_screen_off_max_freq(struct kobject *a, struct attribute *b,
+					    const char *buf, size_t count)
+{
+	unsigned int input;
+	int ret;
+	ret = sscanf(buf, "%u", &input);
+
+	if (ret != 1)
+		  return -EINVAL;
+
+	if (input < 122880 || input > 2000000) {
+		  printk("ondemandtcl: invalid sleep freq\n");
+		  return -EINVAL;
+	}
+
+	sleep_max_freq = input;
+
+	return count;
+}
+
+static ssize_t store_screenstate_enable(struct kobject *a, struct attribute *b,
+						const char *buf, size_t count)
+{
+	unsigned int input;
+	int ret; 
+	ret = sscanf(buf, "%u", &input);
+
+	if (ret != 1)
+		  return -EINVAL;
+
+	if (input != 0 && input != 1) {
+		  return -EINVAL;
+	}
+
+	ss_enabled = input;
+
+	return count;
+}
+ 
 define_one_global_rw(sampling_rate);
 define_one_global_rw(io_is_busy);
 define_one_global_rw(up_threshold);
@@ -999,6 +1077,8 @@ define_one_global_rw(ignore_nice_load);
 define_one_global_rw(powersave_bias);
 define_one_global_rw(max_tickle_window);
 define_one_global_rw(max_floor_window);
+define_one_global_rw(screen_off_max_freq);
+define_one_global_rw(screenstate_enable);
 
 static struct attribute *dbs_attributes[] = {
 	&sampling_rate_max.attr,
@@ -1012,6 +1092,8 @@ static struct attribute *dbs_attributes[] = {
 	&io_is_busy.attr,
 	&max_tickle_window.attr,
 	&max_floor_window.attr,
+	&screen_off_max_freq.attr,
+	&screenstate_enable.attr,
 	NULL
 };
 
@@ -1076,7 +1158,7 @@ dbs_freq_increase(struct cpufreq_policy *p, unsigned int freq)
 	else if (p->cur == p->max)
 		return;
 
-	__cpufreq_driver_target(p, freq, dbs_tuners_ins.powersave_bias ?
+	cpufreq_target(p, freq, dbs_tuners_ins.powersave_bias ?
 			CPUFREQ_RELATION_L : CPUFREQ_RELATION_H);
 }
 
@@ -1173,7 +1255,7 @@ static void do_tickle_state_change(struct work_struct *work)
 				/* ramp up to the policy max */
 				if (policy->cur < policy->max) {
 					record_sample(policy->cur, policy->max, -2, policy->cpu);
-					__cpufreq_driver_target(policy, policy->max, CPUFREQ_RELATION_H);
+					cpufreq_target(policy, policy->max, CPUFREQ_RELATION_H);
 				}
 
 				dbs_info->tickle_active = 1;
@@ -1383,7 +1465,7 @@ static void do_floor_state_change(struct work_struct *work)
 
 				if (policy->cur < f) {
 					record_sample(policy->cur, f, -3, policy->cpu);
-					__cpufreq_driver_target(policy, f, CPUFREQ_RELATION_H);
+					cpufreq_target(policy, f, CPUFREQ_RELATION_H);
 				}
 
 				mutex_unlock(&dbs_info->timer_mutex);
@@ -1673,7 +1755,7 @@ static void adjust_for_load(struct cpu_dbs_info_s *this_dbs_info)
 			}
 
 			record_sample(policy->cur, policy->max, load, policy->cpu);
-			__cpufreq_driver_target(policy, policy->max,
+			cpufreq_target(policy, policy->max,
 				CPUFREQ_RELATION_H);
 		} else {
 			int freq = powersave_bias_target(policy, policy->max,
@@ -1688,7 +1770,7 @@ static void adjust_for_load(struct cpu_dbs_info_s *this_dbs_info)
 				}
 			}
 			record_sample(policy->cur, freq, load, policy->cpu);
-			__cpufreq_driver_target(policy, freq,
+			cpufreq_target(policy, freq,
 				CPUFREQ_RELATION_L);
 		}
 		return;
@@ -1728,7 +1810,7 @@ static void adjust_for_load(struct cpu_dbs_info_s *this_dbs_info)
 				}
 			}
 			record_sample(policy->cur, freq_next, load, policy->cpu);
-			__cpufreq_driver_target(policy, freq_next,
+			cpufreq_target(policy, freq_next,
 					CPUFREQ_RELATION_L);
 		} else {
 			int freq = powersave_bias_target(policy, freq_next,
@@ -1742,7 +1824,7 @@ static void adjust_for_load(struct cpu_dbs_info_s *this_dbs_info)
 				}
 			}
 			record_sample(policy->cur, freq, load, policy->cpu);
-			__cpufreq_driver_target(policy, freq,
+			cpufreq_target(policy, freq,
 				CPUFREQ_RELATION_L);
 		}
 	}
@@ -1777,7 +1859,7 @@ static void do_dbs_timer(struct work_struct *work)
 		}
 	} else {
 		record_sample(dbs_info->cur_policy->cur, dbs_info->freq_lo, -1, cpu);
-		__cpufreq_driver_target(dbs_info->cur_policy,
+		cpufreq_target(dbs_info->cur_policy,
 			dbs_info->freq_lo, CPUFREQ_RELATION_H);
 	}
 	queue_delayed_work_on(cpu, kondemand_wq, &dbs_info->work, delay);
@@ -1892,8 +1974,7 @@ static void dbs_refresh_callback(struct work_struct *unused)
 		policy->cur = policy->max;
 
 		record_sample(policy->cur, policy->max, -200, policy->cpu);
-		__cpufreq_driver_target(policy, policy->max,
-					CPUFREQ_RELATION_L);
+		cpufreq_target(policy, policy->max, CPUFREQ_RELATION_L);
 		this_dbs_info->prev_cpu_idle = get_cpu_idle_time(0,
 				&this_dbs_info->prev_cpu_wall);
 	}
@@ -2088,12 +2169,12 @@ static int cpufreq_governor_dbs(struct cpufreq_policy *policy,
 		mutex_lock(&this_dbs_info->timer_mutex);
 		if (policy->max < this_dbs_info->cur_policy->cur) {
 			record_sample(policy->cur, policy->max, -1, policy->cpu);
-			__cpufreq_driver_target(this_dbs_info->cur_policy,
+			cpufreq_target(this_dbs_info->cur_policy,
 			                        policy->max,
 			                        CPUFREQ_RELATION_H);
 		} else if (policy->min > this_dbs_info->cur_policy->cur) {
 			record_sample(policy->cur, policy->min, -1, policy->cpu);
-			__cpufreq_driver_target(this_dbs_info->cur_policy,
+			cpufreq_target(this_dbs_info->cur_policy,
 			                        policy->min,
 			                        CPUFREQ_RELATION_L);
 		}
@@ -2183,7 +2264,8 @@ MODULE_AUTHOR("Venkatesh Pallipadi <venkatesh.pallipadi@intel.com>");
 MODULE_AUTHOR("Alexey Starikovskiy <alexey.y.starikovskiy@intel.com>");
 MODULE_AUTHOR("Corey Tabaka <corey.tabaka@palm.com>");
 MODULE_DESCRIPTION("'cpufreq_ondemand_tickle' - A dynamic cpufreq governor for "
-                   "Low Latency Frequency Transition capable processors");
+                   "Low Latency Frequency Transition capable processors"
+                   "With Screenstate");
 MODULE_LICENSE("GPL");
 
 #ifdef CONFIG_CPU_FREQ_DEFAULT_GOV_ONDEMAND_TICKLE
